@@ -48,6 +48,8 @@
 #include <soc/qcom/service-notifier.h>
 #include <soc/qcom/socinfo.h>
 #include <soc/qcom/ramdump.h>
+#include <linux/project_info.h>
+static u32 fw_version;
 
 #include "wlan_firmware_service_v01.h"
 
@@ -298,6 +300,7 @@ enum icnss_driver_state {
 	ICNSS_HOST_TRIGGERED_PDR,
 	ICNSS_FW_DOWN,
 	ICNSS_DRIVER_UNLOADING,
+	ICNSS_REJUVENATE,
 };
 
 struct ce_irq_list {
@@ -1187,6 +1190,14 @@ bool icnss_is_fw_down(void)
 }
 EXPORT_SYMBOL(icnss_is_fw_down);
 
+bool icnss_is_rejuvenate(void)
+{
+	if (!penv)
+		return false;
+	else
+		return test_bit(ICNSS_REJUVENATE, &penv->state);
+}
+EXPORT_SYMBOL(icnss_is_rejuvenate);
 
 int icnss_power_off(struct device *dev)
 {
@@ -2007,6 +2018,7 @@ static void icnss_qmi_wlfw_clnt_ind(struct qmi_handle *handle,
 		event_data->crashed = true;
 		event_data->fw_rejuvenate = true;
 		fw_down_data.crashed = true;
+		set_bit(ICNSS_REJUVENATE, &penv->state);
 		icnss_call_driver_uevent(penv, ICNSS_UEVENT_FW_DOWN,
 					 &fw_down_data);
 		icnss_driver_event_post(ICNSS_DRIVER_EVENT_PD_SERVICE_DOWN,
@@ -2097,6 +2109,7 @@ static int icnss_driver_event_server_arrive(void *data)
 
 err_setup_msa:
 	icnss_assign_msa_perm_all(penv, ICNSS_MSA_PERM_HLOS_ALL);
+	clear_bit(ICNSS_MSA0_ASSIGNED, &penv->state);
 err_power_on:
 	icnss_hw_power_off(penv);
 fail:
@@ -2190,6 +2203,7 @@ static int icnss_pd_restart_complete(struct icnss_priv *priv)
 
 	icnss_call_driver_shutdown(priv);
 
+	clear_bit(ICNSS_REJUVENATE, &penv->state);
 	clear_bit(ICNSS_PD_RESTART, &priv->state);
 
 	if (!priv->ops || !priv->ops->reinit)
@@ -3902,6 +3916,9 @@ static int icnss_stats_show_state(struct seq_file *s, struct icnss_priv *priv)
 		case ICNSS_FW_DOWN:
 			seq_puts(s, "FW DOWN");
 			continue;
+		case ICNSS_REJUVENATE:
+			seq_puts(s, "FW REJUVENATE");
+			continue;
 		case ICNSS_DRIVER_UNLOADING:
 			seq_puts(s, "DRIVER UNLOADING");
 		}
@@ -4379,6 +4396,24 @@ static int icnss_get_vbatt_info(struct icnss_priv *priv)
 	return 0;
 }
 
+/* Initial and show wlan firmware build version */
+void cnss_set_fw_version(u32 version) {
+        fw_version = version;
+}
+EXPORT_SYMBOL(cnss_set_fw_version);
+
+static ssize_t cnss_version_information_show(struct device *dev,
+                                struct device_attribute *attr, char *buf)
+{
+        if (!penv)
+                return -ENODEV;
+        return scnprintf(buf, PAGE_SIZE, "%u.%u.%u.%u\n", (fw_version & 0xf0000000) >> 28,
+        (fw_version & 0xf000000) >> 24, (fw_version & 0xf00000) >> 20, fw_version & 0x7fff);
+}
+
+static DEVICE_ATTR(cnss_version_information, 0444,
+                cnss_version_information_show, NULL);
+
 static int icnss_probe(struct platform_device *pdev)
 {
 	int ret = 0;
@@ -4575,6 +4610,10 @@ static int icnss_probe(struct platform_device *pdev)
 
 	penv = priv;
 
+        /* Create device file */
+        device_create_file(&penv->pdev->dev, &dev_attr_cnss_version_information);
+        push_component_info(WCN, "WCN3990", "QualComm");
+
 	icnss_pr_info("Platform driver probed successfully\n");
 
 	return 0;
@@ -4596,6 +4635,8 @@ static int icnss_remove(struct platform_device *pdev)
 	device_init_wakeup(&penv->pdev->dev, false);
 
 	icnss_debugfs_destroy(penv);
+
+	device_remove_file(&penv->pdev->dev, &dev_attr_cnss_version_information);
 
 	icnss_modem_ssr_unregister_notifier(penv);
 
